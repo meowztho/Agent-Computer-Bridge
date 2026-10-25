@@ -1,0 +1,3 @@
+# Optional standard MCP integration for AI harnesses such as ZCode.
+# v2 is the current stable SDK line and supports stdio MCP.
+mcp>=2,<3

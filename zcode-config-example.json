@@ -1,0 +1,8 @@
+{
+  "plugins": {
+    "enabled": true,
+    "dirs": [
+      "C:\\ABSOLUTE\\PATH\\Agent-Computer-Bridge"
+    ]
+  }
+}

@@ -1,0 +1,4 @@
+# Versions used in the project's real Windows test runs.
+PyAutoGUI==0.9.54
+Pillow==12.3.0
+uiautomation==2.0.29; platform_system == "Windows"

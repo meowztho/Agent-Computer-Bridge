@@ -1,0 +1,3 @@
+# Optional HWND-bound Windows.Graphics.Capture provider.
+# Current PyPI release verified against the r19 implementation contract.
+windows-capture==2.0.1; platform_system == "Windows"
