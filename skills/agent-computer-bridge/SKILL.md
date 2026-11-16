@@ -20,8 +20,14 @@ core requirements from `requirements.txt` and verify them.
 
 If Python itself is missing, the batch launcher prints a Python 3.10+ for
 Windows prerequisite. Do not configure MCP for the default shell mode.
-`agent.cmd diagnose` performs further desktop/UIA/capture checks when the
-core dependencies are ready.
+`agent.cmd diagnose` checks the desktop/UIA and attempts one transient
+screenshot capture (no image saved or returned); capture failure is reported
+as blocked readiness. The standalone process cannot assess the server's
+physical Esc hook; `diagnose` reports its own readiness separately from an
+identity-verified `server_diagnostics` result (or an explicit unavailable/
+mismatched status). Neither hook availability nor captured pixels prove an
+actual physical stop or correct application rendering. `agent.cmd doctor`
+does not capture the desktop.
 
 Optional capabilities can be installed as required using
 `agent.cmd setup --with-wgc` (graphics), `--with-mcp` (MCP SDK), or
@@ -54,9 +60,45 @@ by default or silently during normal Computer Use.
 7. `agent.cmd finish --controller-id ID` releases only your lease and keeps
    a pre-existing server running. Physical **Esc** stops computer control.
 
+`agent.cmd focus --controller-id ID --hwnd HWND` selects the scope and
+verifies that the target is really the foreground window after activation.
+`activated: false` with `retry: reobserve` means another window re-took focus:
+re-observe and do not assume the target is reachable. `focus` injects no input
+and does not force the window topmost.
+
+Every observation carries `pointer` (screen and target-relative position,
+this state's raster coordinates, and the hovered control when local UIA
+exposes one) and `input_readiness` (`target_is_foreground`, `foreground`,
+`minimized`, `occluded_by`, `capture_occlusion_independent`, `keyboard_ready`).
+A valid screenshot does **not** prove input is possible: keyboard input needs
+the target in the foreground, and pointer clicks additionally pass the point
+hit-test. `--no-image` still returns both blocks.
+
 Use [references/shell-roundtrip.md](references/shell-roundtrip.md) for complete
 copyable examples, recovery, diagnostic errors and the transport decision.
 This is the first stop if your harness has no registered tools.
+
+## Text-first operation when the model has no vision
+
+`agent.cmd observe --controller-id ID --no-image` returns a fresh
+`state_id` and `machine_view` without transferring a PNG. Examine
+`machine_view.control_candidates`: current element indices, names,
+roles, enabled state and **candidate-only** provenance from local UIA.
+If a named local control clearly matches the user's task, prefer its
+current index to guessing coordinates. A new observation is still needed
+to verify the result. `machine_view.pointer` shows where the pointer is,
+and `machine_view.input_readiness` shows whether the target is foreground
+and keyboard-ready before you choose an action.
+
+`machine_view.vision.recommended` flags missing structural evidence:
+RDP local UIA does not see remote content. This does **not authorize**
+blind mouse coordinates. When text metadata is insufficient, observe
+again with an image and consult a vision-capable subagent/tool **if one
+is already available**. Pass only the relevant screenshot, user context,
+state and coordinate frame; the original controller must verify any
+proposed coordinate against a fresh state before acting. The bridge
+does not launch subagents. Without reliable semantic or visual evidence,
+do not guess an action: report the limitation.
 
 ## Alternative: already-available MCP tools
 
@@ -70,19 +112,36 @@ prefer the included shell path when an agent can execute commands.
 Never issue a second controller lease or start a competing server from a
 different transport; choose **one** transport for the task.
 
+## Human recorder launcher (no manual pip commands)
+
+On Windows, double-click `record.bat` or `record.cmd` to record a
+demonstration. The first launch automatically verifies the Core requirements
+and installs missing packages via the existing `agent_setup.py` owner.
+Subsequent launches reuse a per-user receipt and skip full package checks,
+while quickly noticing changed Python, requirements, runtime or installed
+package files. `record.bat --check` verifies without opening the GUI;
+`record.bat --repair` forces fresh verification/repair and then opens it.
+Failed setup never receives a success receipt. Python 3.10+ is required
+for this source launcher; the separate portable recorder EXE needs no
+Python. Recorder auto-install does **not** enable MCP or build tools.
+
 ## Human demonstration: conversation + recording
 
 The **user's chat message is the task context**. The recorder's
 Goal/Prerequisites/Success fields are optional. A demonstration ZIP describes
 how something was shown, not an independently determined purpose.
 
-1. Read `agent_handoff.json` with the chat, locate the relevant application
-   segments and screenshot references. For older ZIPs, start with
-   `procedure.json`.
-2. Inspect relevant screenshots (and optional `before_image` for transient
-   menus), then `procedure.json` for timing, confidence, pixel positions,
-   ambiguities, capture quality and integrity. Use `agent_steps.json` for
-   details, `steps.json` only for debugging.
+1. Read `agent_handoff.json` with the user's message; `machine_view`
+   and `steps[].machine_instruction` provide a **text-first** route
+   through observed human actions and post-event local target candidates.
+   These candidates are not proven action recipients. Older ZIPs use
+   `procedure.json` directly.
+2. Use `machine_view.vision_review.requests` only for relevant unresolved
+   actions selected by conversation context. Pass specific historical
+   screenshot references (including `before_image` for transient menus)
+   to an available vision tool when needed, not the whole ZIP by default.
+   For deeper evidence check `procedure.json`, `agent_steps.json` and only
+   then `steps.json` for diagnostics.
 3. Local UIA candidates sampled after the event are **not proven** action
    recipients. Remote Desktop content is raster-only to the local bridge,
    so the client's UIA nodes never identify remote app controls.

@@ -31,6 +31,7 @@ RELEASE_FILES = (
     "install-wgc.cmd",
     "start.cmd",
     "record.cmd",
+    "record.bat",
     "mcp.cmd",
     "build-recorder-portable.cmd",
     "build-recorder-portable.bat",
@@ -54,15 +55,57 @@ RELEASE_FILES = (
     "tests/test_release_package.py",
     "tests/test_shell_entrypoint.py",
     "tests/test_dependency_bootstrap.py",
+    "tests/test_recorder_bootstrap.py",
+    "tests/test_machine_guidance.py",
+    "tests/test_state_binding_hardening.py",
+    "tests/test_pointer_and_foreground.py",
 )
 BINARY_SUFFIXES = {".exe", ".png", ".ico"}
 # Application-specific cases are historical evidence, not reusable guidance.
 FORBIDDEN_SHIPPED_TEXT = ("a" + "tas", "bridge " + "executor", "chart " + "strategies")
-ZIP_TIME = (2026, 10, 17, 0, 0, 0)
+
+
+def _canonical_build_id() -> str:
+    source = (ROOT / "agent_computer_bridge.py").read_text(encoding="utf-8")
+    match = re.search(r'^BUILD_ID = "([^"]+)"$', source, re.MULTILINE)
+    if match is None:
+        raise ValueError("canonical runtime has no BUILD_ID")
+    return match.group(1)
+
+
+def zip_time_from_build_id(build_id: str) -> tuple[int, int, int, int, int, int]:
+    match = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})(?:-r\d+)?", build_id)
+    if match is None:
+        raise ValueError("invalid BUILD_ID date: " + build_id)
+    year, month, day = (int(part) for part in match.groups())
+    return (year, month, day, 0, 0, 0)
+
+
+# Deterministic archive timestamp tracks the release build date.
+ZIP_TIME = zip_time_from_build_id(_canonical_build_id())
 
 
 def sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _text_outside_fenced_blocks(text: str) -> str:
+    kept: list[str] = []
+    in_fence = False
+    for line in text.splitlines():
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if not in_fence:
+            kept.append(line)
+    return "\n".join(kept)
+
+
+def validate_shipped_text(name: str, text: str) -> None:
+    if "\ufffd" in text:
+        raise ValueError(f"{name}: contains U+FFFD replacement character")
+    if PurePosixPath(name).suffix.lower() == ".md" and "\\n" in _text_outside_fenced_blocks(text):
+        raise ValueError(f"{name}: contains a literal backslash-n sequence in Markdown prose")
 
 
 def release_files() -> tuple[str, list[str]]:
@@ -105,6 +148,7 @@ def files_and_hashes() -> tuple[str, dict[str, bytes], dict[str, str]]:
         body = file.read_bytes()
         if file.suffix.lower() not in BINARY_SUFFIXES:
             text = body.decode("utf-8")
+            validate_shipped_text(name, text)
             violations = [term for term in FORBIDDEN_SHIPPED_TEXT if term in text.casefold()]
             if violations:
                 raise ValueError(f"domain-specific text in {name}: {violations}")

@@ -93,6 +93,13 @@ def observation(args: argparse.Namespace) -> dict:
     else:
         raster.pop("base64", None)
     ax = payload.get("accessibility") or {}
+    machine_view = dict(payload.get("machine_view") or {})
+    if machine_view.get("vision"):
+        machine_view["vision"] = {
+            **machine_view["vision"],
+            "screenshot_path": save_path,
+            "requires_external_image_reader": True,
+        }
     return {
         "ok": True,
         "state_id": payload.get("state_id"),
@@ -100,15 +107,44 @@ def observation(args: argparse.Namespace) -> dict:
         "surface": payload.get("surface"),
         "target_window": payload.get("target_window"),
         "screenshot_path": save_path,
+        "machine_view": machine_view,
         "raster": raster,
         "accessibility": {
             "available": ax.get("available"), "reason": ax.get("reason"),
             "elements": (ax.get("elements") or [])[:args.max_nodes],
             "node_count": ax.get("node_count"), "truncated": ax.get("truncated"),
         },
+        # Pointer/readiness are independent of the raster and stay available
+        # with --no-image. The contract is the Core's own coordinate contract.
+        "pointer": payload.get("pointer"),
+        "input_readiness": payload.get("input_readiness"),
+        "contract": payload.get("contract"),
         "next": ("Choose element_index for local UI or image_x/image_y from this screenshot. "
                  "Run one agent.cmd action with --controller-id and --state-id, "
                  "then run agent.cmd observe again to verify its result."),
+    }
+
+
+def focus(args: argparse.Namespace) -> dict:
+    """Select and verify a target window as foreground; no input injection."""
+    reply = api(args, "scope", data={
+        "controller_id": args.controller_id, "hwnd": args.hwnd, "activate": True})
+    if not isinstance(reply, dict):
+        reply = {"ok": False, "error": "invalid bridge reply"}
+    if not reply.get("ok"):
+        return {**reply, "stage": "focus", "activated": False,
+                "foreground": None, "foreground_lost": False,
+                "retry": "reobserve",
+                "message": reply.get("error") or "window scope request failed"}
+    verified = bool(reply.get("activated"))
+    return {
+        "ok": verified,
+        "activated": verified,
+        "foreground": reply.get("foreground"),
+        "foreground_lost": bool(reply.get("foreground_lost")),
+        "retry": "none" if verified else "reobserve",
+        "message": reply.get("message"),
+        "scope": reply.get("scope"),
     }
 
 
@@ -145,6 +181,39 @@ def action_payload(args: argparse.Namespace) -> dict:
     return payload
 
 
+def compare_server_diagnostics(args: argparse.Namespace) -> dict:
+    """Read-only comparison; never use local process state as server evidence."""
+    status = core.query_status("127.0.0.1", args.port,
+                               os.environ.get("AGENT_COMPUTER_TOKEN"))
+    if not status.get("ok"):
+        return {"status": "unavailable",
+                "reason": "No authenticated running server could be verified."}
+    if not status.get("matches_current_file"):
+        return {"status": "build_mismatch",
+                "reason": "Running server is not the local Bridge build; its diagnostics were not trusted."}
+    try:
+        server = api(args, "doctor")
+    except (OSError, ValueError) as exc:
+        return {"status": "unavailable", "reason": str(exc)}
+    identity = status.get("reported") or {}
+    if (not server.get("ok") and "diagnostic_context" not in server):
+        return {"status": "unverified", "reason": "Server diagnostic request failed."}
+    if (server.get("diagnostic_context") != "bridge_server"
+            or server.get("version") != core.VERSION
+            or server.get("build_id") != core.BUILD_ID
+            or server.get("pid") != identity.get("pid")):
+        return {"status": "unverified",
+                "reason": "Server diagnostic identity does not match verified running instance."}
+    escape = next((item for item in server.get("checks", [])
+                   if item.get("name") == "physical_escape_stop"), None)
+    if escape is None:
+        return {"status": "unverified", "reason": "Server Esc diagnostic was missing."}
+    return {"status": "matching", "pid": server["pid"],
+            "version": server["version"], "build_id": server["build_id"],
+            "readiness": server.get("readiness"),
+            "physical_escape_stop": escape}
+
+
 def execute(args: argparse.Namespace) -> dict:
     if args.command == "help":
         return {
@@ -153,6 +222,7 @@ def execute(args: argparse.Namespace) -> dict:
                 "agent.cmd start",
                 "agent.cmd windows",
                 "agent.cmd observe --controller-id <id> [--hwnd <number>]",
+                "agent.cmd focus --controller-id <id> --hwnd <number>",
                 "agent.cmd click --controller-id <id> --state-id <fresh_state> --image-x 100 --image-y 100",
                 'agent.cmd type --controller-id <id> --state-id <fresh_state> --text "Hello"',
                 "agent.cmd observe --controller-id <id>",
@@ -165,7 +235,12 @@ def execute(args: argparse.Namespace) -> dict:
                       "Do not bypass physical Esc or the active controller."],
         }
     if args.command in {"doctor", "diagnose"}:
-        return core.doctor_report(capture_probe=False)
+        # The local diagnostic process does not own the running server's Esc hook.
+        # Keep the explicitly requested capture probe local and non-persistent.
+        report = core.doctor_report(capture_probe=args.command == "diagnose")
+        if args.command == "diagnose":
+            report["server_diagnostics"] = compare_server_diagnostics(args)
+        return report
     if args.command == "start":
         result = core.agent_session_bootstrap(
             "127.0.0.1", args.port, os.environ.get("AGENT_COMPUTER_TOKEN"),
@@ -198,6 +273,8 @@ def execute(args: argparse.Namespace) -> dict:
                 "next": "Use agent.cmd observe --controller-id <id> --hwnd <current HWND> to target one window."}
     if args.command == "observe":
         return observation(args)
+    if args.command == "focus":
+        return focus(args)
     if args.command in ACTION_NAMES:
         reply = api(args, args.command, data=action_payload(args))
         if reply.get("ok"):
@@ -220,7 +297,7 @@ def parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
     sub.add_parser("help")
     sub.add_parser("doctor")
-    sub.add_parser("diagnose", help="full Core doctor for runtime capture/UIA after dependencies are installed")
+    sub.add_parser("diagnose", help="full Core doctor including one transient desktop capture probe (no screenshot saved or returned)")
     start = sub.add_parser("start", help="start or connect to the existing Bridge and acquire a controller")
     start.add_argument("--lease-seconds", type=float, default=240)
     windows = sub.add_parser("windows", help="list or filter windows; no controller mutation")
@@ -231,6 +308,10 @@ def parser() -> argparse.ArgumentParser:
     observe.add_argument("--no-image", action="store_true")
     observe.add_argument("--depth", type=int, default=3)
     observe.add_argument("--max-nodes", type=int, default=80)
+    focus_cmd = sub.add_parser(
+        "focus", help="select a window scope and verify it is the foreground window; no input injection")
+    focus_cmd.add_argument("--controller-id", required=True)
+    focus_cmd.add_argument("--hwnd", type=int, required=True)
     for name in ACTION_NAMES:
         ap = sub.add_parser(name)
         ap.add_argument("--controller-id", required=True)

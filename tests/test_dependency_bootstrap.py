@@ -106,16 +106,54 @@ class BootstrapDependenciesTests(unittest.TestCase):
         self.assertNotIn("requirements-mcp.txt", " ".join(args))
         self.assertNotIn("requirements-portable.txt", " ".join(args))
 
-    def test_pip_missing_returns_actionable_error_without_hidden_retry(self):
+    def test_missing_pip_after_normal_process_exit_identifies_exact_interpreter(self):
+        before = {"ok": False, "python": {"supported": True}, "windows": True,
+                  "groups": {"core": {"ready": False}}}
+        completed = type("Result", (), {"returncode": 1, "stdout": "",
+                                         "stderr": "No module named pip"})()
+        with patch.object(agent_setup, "status", return_value=before), \
+             patch.object(agent_setup.subprocess, "run",
+                          return_value=completed) as run, \
+             patch.object(agent_setup.importlib.util, "find_spec",
+                          return_value=None):
+            result = agent_setup.install()
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["installer_exit_code"], 1)
+        self.assertIn("No module named pip", result["installer_tail"])
+        self.assertIn("ensurepip --upgrade", result["next"])
+        self.assertIn(agent_setup.sys.executable, result["next"])
+        self.assertIn("agent.cmd setup", result["next"])
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args.args[0][:3],
+                         [agent_setup.sys.executable, "-m", "pip"])
+
+    def test_network_or_index_pip_failure_is_not_misdiagnosed_as_missing_pip(self):
+        before = {"ok": False, "python": {"supported": True}, "windows": True,
+                  "groups": {"core": {"ready": False}}}
+        completed = type("Result", (), {"returncode": 1, "stdout": "",
+                                         "stderr": "No matching distribution found"})()
+        with patch.object(agent_setup, "status", return_value=before), \
+             patch.object(agent_setup.subprocess, "run",
+                          return_value=completed), \
+             patch.object(agent_setup.importlib.util, "find_spec",
+                          return_value=object()):
+            result = agent_setup.install()
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["installer_exit_code"], 1)
+        self.assertIn("installer_tail", result["next"])
+        self.assertNotIn("ensurepip", result["next"])
+        self.assertNotIn("pip is missing", result["next"])
+
+    def test_subprocess_oserror_is_not_automatically_missing_pip(self):
         before = {"ok": False, "python": {"supported": True}, "windows": True,
                   "groups": {"core": {"ready": False}}}
         with patch.object(agent_setup, "status", return_value=before), \
              patch.object(agent_setup.subprocess, "run",
-                          side_effect=OSError("pip missing")):
+                          side_effect=OSError("permission denied")):
             result = agent_setup.install()
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"], "OSError")
-        self.assertIn("ensurepip", result["next"])
+        self.assertNotIn("ensurepip", result["next"])
 
     def test_help_is_stdlib_only_and_explains_optional_groups(self):
         self.assertEqual(agent_setup.main(["help"]), 0)

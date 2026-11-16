@@ -31,10 +31,43 @@ To scope a specific window, choose its **current** HWND from `windows`:
 agent.cmd observe --controller-id CONTROLLER_ID --hwnd CURRENT_HWND
 ```
 
+When another window keeps re-taking focus, select the scope and verify the
+foreground explicitly:
+
+```bat
+agent.cmd focus --controller-id CONTROLLER_ID --hwnd CURRENT_HWND
+```
+
+`focus` injects no input and does not force topmost. It returns `activated`,
+`foreground`, `foreground_lost`, `retry` and `message`. `activated: false`
+with `retry: reobserve` means the window did **not** hold the foreground
+after a short settle; re-observe, then raise or re-focus the target instead
+of clicking through an unknown owner.
+
 The observation returns `state_id`, `target_window`, `surface`,
-`accessibility.elements` and `screenshot_path`. The screenshot is a
-PNG saved in the Windows temp directory; only its **path**, not multi-MB
-base64, appears in the console JSON.
+`accessibility.elements`, `pointer`, `input_readiness` and `screenshot_path`.
+The screenshot is a PNG saved in the Windows temp directory; only its
+**path**, not multi-MB base64, appears in the console JSON.
+
+`pointer` contains `screen` (virtual-desktop x/y), `target_relative`
+(relative to the observed target, or null), `inside_target`, `image`
+(this state's raster pixel, or null) and `hover` (the local UIA control at
+the pointer, or null; password/unknown text is never exposed). Image pixels
+are valid only for that `state_id`.
+
+`input_readiness` contains `target_is_foreground`, `foreground`, `minimized`,
+`occluded_by`, `capture_occlusion_independent` and `keyboard_ready`. A valid
+screenshot does **not** prove input is possible: keyboard input needs the
+target in the foreground, and pointer clicks additionally pass the point
+hit-test. `--no-image` still returns both blocks.
+
+**Text-only agents:** Use `agent.cmd observe --controller-id ID --no-image`
+to avoid transferring a screenshot when a native local UIA candidate can
+resolve the task. Read `machine_view.control_candidates` and check the
+candidate-only attribution. If the target is ambiguous or raster-only,
+use a **new** screenshot and ask an available vision tool/subagent for
+that image and goal. The original agent retains input control and must
+re-observe to validate proposed coordinates. Do not click blindly.
 
 **Visual agents:** Open `screenshot_path` using your available file-image
 inspection tool. This is especially important for icons, menus, custom-drawn

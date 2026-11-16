@@ -6,7 +6,14 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import agent_computer_bridge as bridge
-import agent_computer_bridge_mcp as mcp
+
+try:
+    import agent_computer_bridge_mcp as mcp
+except (ImportError, SystemExit):  # optional mcp SDK is absent
+    mcp = None
+    MCP_AVAILABLE = False
+else:
+    MCP_AVAILABLE = True
 
 
 class RemoteSurfaceTests(unittest.TestCase):
@@ -98,6 +105,7 @@ class RemoteSurfaceTests(unittest.TestCase):
         self.assertEqual(error.exception.code, "STALE_STATE")
 
 
+@unittest.skipUnless(MCP_AVAILABLE, "optional mcp SDK is not installed")
 class McpMissingToolsTests(unittest.TestCase):
     def test_named_key_uses_existing_canonical_endpoint(self):
         with patch.object(mcp.SESSION, "mutate", return_value={"ok": True}) as mutate:

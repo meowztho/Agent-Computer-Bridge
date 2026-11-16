@@ -5,20 +5,20 @@ Windows bridge for two complementary capabilities:
 1. **Computer Use for agents**: observe the desktop (screenshots and local UI Automation), select a scoped window, send state-bound mouse/keyboard input and verify the visible effect.
 2. **Human demonstration recording**: record physical interaction at normal speed and export a machine-readable ZIP that an agent interprets **together with the user's conversation**. Recording is passive: no input is injected.
 
-The implementation is application/domain neutral. RDP and other nested desktop clients are handled as raster surfaces, not as remotely accessible local UI Automation trees.
+The implementation is application/domain neutral. Known Microsoft remote desktop clients (`mstsc.exe`, `msrdc.exe`, `msrdcw.exe`, `rdclient.windows.exe`) and their remote-desktop window classes are detected as raster-only remote surfaces, not as remotely accessible local UI Automation trees. Other third-party remote viewers (for example Citrix, VNC or Parsec) are not on that detection allowlist and may be classified as ordinary local windows, so treat any remote content as raster-only and re-observe before every real action.
 
 ## Release
 
-- **Version:** 2.42 / r47
+- **Version:** 2.50 / r55
 - **Canonical runtime:** `agent_computer_bridge.py`
-- **Byte-identical, versioned source:** `agent_computer_bridge_v2_42_r47.py`
+- **Byte-identical, versioned source:** `agent_computer_bridge_v2_50_r55.py`
 - **MCP adapter:** `agent_computer_bridge_mcp.py`
 - **Agent instructions:** `skills/agent-computer-bridge/SKILL.md`
 - **Windows support:** Windows 11; Python 3 with the Windows `py` launcher for the source/MCP runtime.
-- **Portable recorder:** `portable/Agent-Computer-Bridge-Recorder-v2.42-r47-portable.exe` (human recorder only, no Python required on the target PC).
+- **Portable recorder:** `portable/Agent-Computer-Bridge-Recorder-v2.50-r55-portable.exe` (human recorder only, no Python required on the target PC). This EXE is a local build artifact produced by `build-recorder-portable.bat`; it is not tracked in Git and is included in the release ZIP only after it has been built.
 - **Deployment:** The distributable ZIP contains the current files only, a `SHA256SUMS.txt` for its contents, and this guide. Historical sources, audits, temporary recordings and previous builds are excluded.
 
-## Quick start ? no MCP configuration required
+## Quick start — no MCP configuration required
 
 Extract the package to a writable Windows folder. The standard shell
 mode needs Python 3.10+ with the Windows `py` launcher, but **not MCP**.
@@ -40,14 +40,22 @@ No normal start, observe or input command silently installs packages.
 Optional groups: `agent.cmd setup --with-wgc` for accelerated capture,
 `--with-mcp` for an already-chosen MCP workflow, and `--with-build-tools`
 for developers rebuilding the EXE. Install only what the current use case
-needs. `agent.cmd diagnose` runs fuller desktop/UIA/capture diagnostics
-after the core environment is ready.
+needs. `agent.cmd diagnose` performs a full desktop/UIA diagnostic including
+**one transient screenshot capture probe**, whose image is neither returned
+nor saved. Unlike this explicit probe, `agent.cmd doctor` only checks the
+dependency environment without capturing the desktop. The `diagnose` output
+labels local-process readiness as `standalone_process`; its Esc check is
+`not_applicable`. A separate `server_diagnostics` entry is populated only
+for an identity-matched running Bridge server, or explicitly reports an
+unavailable/mismatched/unverified server. Server Esc-hook status is not proof
+that a physical Esc keypress has been tested.
 
 For an agent that can run shell commands, the supported default is:
 
 ```bat
 agent.cmd start
 agent.cmd windows
+agent.cmd focus --controller-id CONTROLLER_ID --hwnd CURRENT_HWND
 agent.cmd observe --controller-id CONTROLLER_ID
 agent.cmd click --controller-id CONTROLLER_ID --state-id FRESH_STATE_ID --image-x 300 --image-y 180
 agent.cmd observe --controller-id CONTROLLER_ID
@@ -64,8 +72,30 @@ available. **Do not click example coordinates without seeing the target.**
 `agent.cmd` reuses the same lease, scoped observations and native input
 owner as MCP. It does **not** require plugin installation or MCP registration.
 After installation, the agent need not inspect the Python project to operate
-the bridge. The complete, copyable recovery/roundtrip contract is in
+the bridge. The public /v1/agent-help and /v1/discovery guidance use the same
+conditional MCP-if-present, otherwise agent.cmd onboarding contract.
+The complete, copyable recovery/roundtrip contract is in
 `skills/agent-computer-bridge/references/shell-roundtrip.md`.
+
+### Text-first Computer Use and optional visual review
+
+`agent.cmd observe --controller-id ID --no-image` returns a fresh state
+and a bounded `machine_view` of named, enabled and onscreen local UIA
+candidates (index, role, label and focus) without a screenshot transfer.
+These are candidates, not proven targets. Text-only agents should
+inspect these before attempting an action.
+
+When local UIA is unavailable, a control is purely graphical, or the
+window is an RDP client, machine_view explains why text evidence
+is insufficient. A new screenshot can be handed to an existing
+vision-capable agent/tool for **read-only interpretation** if available.
+The bridge does not provide OCR or autonomously invoke subagents;
+the original controller validates fresh observations before any input.
+
+Recorder exports also supply `agent_handoff.json.machine_view` with
+text-oriented steps and at most six prioritized historical image-review
+requests. This index is derived from existing evidence; no extra
+capture worker or user delay is added.
 
 ### Optional MCP integration
 
@@ -75,15 +105,17 @@ MCP dependencies on this host use `install-mcp.cmd`; `install-wgc.cmd`
 installs an optional accelerated capture provider. Neither is required for
 the default shell workflow.
 
-The MCP equivalent is `computer_start` ? `computer_observe` ? state-bound
-action ? re-observe ? `computer_finish`. Use exactly one transport/lease
+The MCP equivalent is `computer_start` → `computer_observe` → state-bound
+action → re-observe → `computer_finish`. Use exactly one transport/lease
 per controller session. The portable human-recorder EXE is independent of
 Python, but the *agent Computer Use* runtime still needs Python + core
 requirements on the host.
 
 ### Human recorder
 
-Launch `record.cmd` for the source-based control window. Alternatively start the standalone `portable/Agent-Computer-Bridge-Recorder-v2.42-r47-portable.exe` on a Windows host.
+Double-click `record.bat` (or `record.cmd`) to launch the source-based recorder. On the **first** run, it checks the core Python packages and automatically installs missing/incompatible requirements using the pinned `requirements.txt` (internet access may be needed). Once verified, it stores a per-user receipt under `%LOCALAPPDATA%\Agent-Computer-Bridge\recorder-dependencies.json`. Subsequent starts skip the full dependency scan and Core import, performing only a lightweight interpreter/version/requirements/runtime fingerprint and installed-package file check. A Python environment change, app update, changed requirements, deleted/replaced package, or missing receipt causes a fresh check. Failed setup is never cached and the console pauses to show the error.
+
+Useful options: `record.bat --check` prepares/checks requirements **without opening** the GUI, and `record.bat --repair` rechecks and repairs even with an existing cache before launching the GUI. This auto-install behavior is **only** for the human recorder shortcut; the agent shell's `agent.cmd setup` remains explicit. Python 3.10+ with the `py` launcher is a prerequisite and is not silently installed. Alternatively start the standalone `portable/Agent-Computer-Bridge-Recorder-v2.50-r55-portable.exe` on a Windows host; it does **not** require a Python installation.
 
 Press Start, demonstrate normally, and Stop & Save. Goal/prerequisites/expected outcome fields are **optional**; the user's chat message is the usual task context. Avoid entering passwords or exposing secrets in screenshots. A successful archive contains:
 
@@ -137,7 +169,8 @@ The packaging script validates that the current source/version match, restricts 
 
 ```text
 agent_computer_bridge.py             canonical core
-agent_computer_bridge_mcp.py         optional thin stdio MCP adapter\nagent_cli.py, agent.cmd               default shell Computer Use (no MCP)
+agent_computer_bridge_mcp.py         optional thin stdio MCP adapter
+agent_cli.py, agent.cmd              default shell Computer Use (no MCP)
 recorder_portable.py                 portable recorder entrypoint
 skills/agent-computer-bridge/        skill, shell roundtrip and Windows surface guidance
 tests/                               unit and isolated integration regressions

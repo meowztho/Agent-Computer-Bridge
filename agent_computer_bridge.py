@@ -269,8 +269,8 @@ except (ImportError, OSError) as exc:
     raise SystemExit(1)
 
 
-VERSION = "2.42"
-BUILD_ID = "2026-10-17-r47"
+VERSION = "2.50"
+BUILD_ID = "2026-11-12-r55"
 API_VERSION = "v1"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
@@ -1376,6 +1376,39 @@ def _rect_intersection(a: dict[str, Any], b: dict[str, Any]) -> dict[str, int] |
     return {"x": left, "y": top, "width": right - left, "height": bottom - top}
 
 
+def _screen_point_from_raster(
+    image_x: Any, image_y: Any, region: dict[str, Any], width: Any, height: Any,
+) -> dict[str, int]:
+    """Canonical raster-pixel -> virtual-desktop mapping.
+
+    Admission and observation must agree on exactly one convention: the
+    observation's image_region_windows_pixels spans its raster width/height.
+    """
+    return {
+        "x": int(region["x"]) + int(int(image_x) * int(region["width"]) / max(1, int(width))),
+        "y": int(region["y"]) + int(int(image_y) * int(region["height"]) / max(1, int(height))),
+    }
+
+
+def _raster_point_from_screen(
+    screen_x: int, screen_y: int, region: dict[str, Any] | None,
+    width: Any, height: Any,
+) -> dict[str, int] | None:
+    """Inverse of _screen_point_from_raster; None when outside the raster region."""
+    if not isinstance(region, dict) or not width or not height:
+        return None
+    rx, ry = int(region["x"]), int(region["y"])
+    rw, rh = int(region["width"]), int(region["height"])
+    if rw <= 0 or rh <= 0:
+        return None
+    if not (rx <= int(screen_x) < rx + rw and ry <= int(screen_y) < ry + rh):
+        return None
+    return {
+        "x": clamp(int(round((int(screen_x) - rx) * int(width) / rw)), 0, int(width) - 1),
+        "y": clamp(int(round((int(screen_y) - ry) * int(height) / rh)), 0, int(height) - 1),
+    }
+
+
 def _scope_occluders(scope: dict[str, Any], region: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """Best-effort list of visible top-level windows above the scoped window that overlap it.
 
@@ -2082,6 +2115,10 @@ def _flatten_accessibility_tree(tree: dict[str, Any] | None) -> list[dict[str, A
             "automation_id": _bounded_text(node.get("automation_id", ""), 160),
             "class_name": _bounded_text(node.get("class_name", ""), 160),
             "bounding_rect_windows_pixels": node.get("bounding_rect"),
+            # The control's own HWND (0 for non-HWND UIA providers). Admission
+            # re-resolution compares it so two distinct HWND-backed controls
+            # with identical name/type/class/automation id cannot be confused.
+            "native_window_handle": int(node.get("native_window_handle") or 0),
             "enabled": bool(node.get("enabled", False)),
             "offscreen": bool(node.get("offscreen", False)),
             "keyboard_focus": bool(node.get("keyboard_focus", False)),
@@ -2094,6 +2131,221 @@ def _flatten_accessibility_tree(tree: dict[str, Any] | None) -> list[dict[str, A
 
     visit(tree)
     return rows
+
+
+# Text-only and multimodal agents share one interpretation of observations.
+# These are derived hints, never an independent UIA/input/vision owner.
+SEMANTIC_CONTROL_TYPES = frozenset({
+    "ButtonControl", "MenuItemControl", "EditControl", "ComboBoxControl",
+    "CheckBoxControl", "RadioButtonControl", "ListItemControl",
+    "TreeItemControl", "TabItemControl", "HyperlinkControl",
+    "SplitButtonControl", "SpinnerControl",
+})
+
+
+def _is_meaningful_control_label(value: Any) -> bool:
+    """Conservative text-first label check; symbols alone aren't semantics."""
+    return sum(char.isalnum() for char in str(value or "")) >= 2
+
+
+def _compact_foreground(window: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Stable four-field foreground identity; never the raw instrumentation window."""
+    if not window:
+        return None
+    return {key: window.get(key) for key in ("hwnd", "pid", "process_name", "title")}
+
+
+def _pointer_hover(
+    surface: dict[str, Any], screen_x: int, screen_y: int,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Bounded hovered-control summary; fail closed exactly like machine_view.
+
+    Password and unknown privacy semantics never expose the real accessible
+    text, and a remote desktop surface has no local UIA evidence for its
+    content at all.
+    """
+    if surface.get("remote"):
+        return None, "remote_surface_has_no_local_uia"
+    try:
+        context = uia_context_at_point(int(screen_x), int(screen_y))
+    except Exception as exc:
+        return None, f"uia_read_failed: {type(exc).__name__}"
+    node = context.get("target")
+    if not isinstance(node, dict):
+        reason = str(context.get("error") or "").strip()
+        return None, reason or (
+            "uia_unavailable" if not context.get("available") else "no_uia_control_at_pointer")
+    name = str(node.get("name") or "")
+    if node.get("is_password") is not False:
+        name = "<password-control>"
+    return {
+        "name": name[:160] if name else None,
+        "role": str(node.get("control_type") or "")[:80] or None,
+        "automation_id": str(node.get("automation_id") or "").strip()[:100] or None,
+    }, None
+
+
+def _pointer_observation(
+    target: dict[str, Any], surface: dict[str, Any], image_info: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Current pointer position in every coordinate frame of this observation.
+
+    Raster pixels reuse the admission mapping, so the same state_id cannot mean
+    two different image coordinate systems.
+    """
+    mx, my = current_mouse()
+    inside_target = _point_in_rect(int(mx), int(my), target)
+    info = image_info or {}
+    image = _raster_point_from_screen(
+        int(mx), int(my), info.get("image_region_windows_pixels"),
+        info.get("width"), info.get("height"))
+    hover, hover_reason = _pointer_hover(surface, int(mx), int(my))
+    return {
+        "screen": {"x": int(mx), "y": int(my)},
+        "target_relative": (
+            {"x": int(mx) - int(target["x"]), "y": int(my) - int(target["y"])}
+            if inside_target else None),
+        "inside_target": bool(inside_target),
+        "image": image,
+        "hover": hover,
+        "hover_reason": hover_reason,
+        "meaning": None,  # the observation owner binds it to the exact state_id
+    }
+
+
+def _input_readiness(
+    target: dict[str, Any], image_info: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Whether keyboard/pointer input is plausible right now, as separate evidence."""
+    foreground = _compact_foreground(focused_window())
+    target_hwnd = int(target.get("hwnd") or 0)
+    target_is_foreground = bool(
+        foreground and target_hwnd
+        and int(foreground.get("hwnd") or 0) == target_hwnd)
+    minimized = bool(target.get("minimized"))
+    occluders: list[dict[str, Any]] = []
+    try:
+        for row in _scope_occluders(target)[:3]:
+            occluders.append({
+                "hwnd": row.get("hwnd"),
+                "title": row.get("title"),
+                "process_name": row.get("process_name"),
+                "overlap": row.get("overlap"),
+            })
+    except Exception:
+        occluders = []
+    capture_binding = (image_info or {}).get("capture_binding") or {}
+    return {
+        "target_is_foreground": target_is_foreground,
+        "foreground": foreground,
+        "minimized": minimized,
+        "occluded_by": occluders,
+        "capture_occlusion_independent": capture_binding.get("occlusion_independent"),
+        "keyboard_ready": bool(target_is_foreground and not minimized),
+        "pointer_note": (
+            "A valid screenshot does not imply input is possible: keyboard input needs the target to be "
+            "the foreground window, and pointer clicks additionally pass the point hit-test."),
+    }
+
+
+def machine_readable_live_view(
+    surface: dict[str, Any], accessibility: dict[str, Any],
+    *, pointer: dict[str, Any] | None = None,
+    input_readiness: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Bounded, conservative live orientation; no invented targets."""
+    remote = surface.get("kind") == "remote_desktop" or bool(surface.get("remote"))
+    nodes = accessibility.get("elements") or []
+    available = bool(accessibility.get("available")) and not remote
+    candidates: list[dict[str, Any]] = []
+    focus: dict[str, Any] | None = None
+    symbolic_only = 0
+    if available:
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            if node.get("is_password") is not False:
+                continue  # Unknown privacy semantics must fail closed.
+            name = str(node.get("name") or "").strip()
+            role = str(node.get("control_type") or "")
+            identity = str(node.get("automation_id") or "").strip()
+            if not name and not identity:
+                continue
+            # Accessible-name glyphs such as gear/close/minimize icons are
+            # *not* a text description of the function. Keep original UIA
+            # metadata outside machine_view, but do not make it evidence that
+            # a non-visual agent has identified a target.
+            meaningful = (_is_meaningful_control_label(name)
+                          or _is_meaningful_control_label(identity))
+            if not meaningful:
+                symbolic_only += 1
+                continue
+            item = {
+                "element_index": node.get("index"),
+                "name": name[:160] if name else None,
+                "automation_id": identity[:100] if identity else None,
+                "role": role[:80],
+                "enabled": bool(node.get("enabled")),
+                "focus": bool(node.get("keyboard_focus")),
+                "candidate_only": True,
+            }
+            if item["focus"]:
+                focus = item
+            if (node.get("enabled") and not node.get("offscreen")
+                    and role in SEMANTIC_CONTROL_TYPES):
+                candidates.append(item)
+    # Selection of a particular button still requires goal interpretation;
+    # presence of UIA controls is not a verified actionable recipient.
+    needs_vision = remote or not available or not candidates
+    view: dict[str, Any] = {
+        "kind": "live_semantic_orientation",
+        "source": "local_uia_read_only",
+        "control_candidates": candidates[:50],
+        "candidate_total": len(candidates),
+        "symbolic_or_uninformative_labels": symbolic_only,
+        "candidate_limit": 50,
+        "focused_candidate": focus,
+        "uia_available_for_target": available,
+        "uia_truncated": bool(accessibility.get("truncated")),
+        "interpretation": ("remote_content_opaque" if remote else
+                           "local_uia_candidates_not_verified_targets" if available else
+                           "local_uia_unavailable"),
+        "vision": {
+            "recommended": needs_vision,
+            "reason": ("remote_surface_has_no_remote_uia" if remote else
+                       "no_trustworthy_local_control_candidate" if needs_vision else
+                       "optional_for_ambiguous_or_custom_drawn_controls"),
+            "scope": "current_observation_screenshot",
+            "request": ("Inspect the current screenshot and identify only the "
+                        "control relevant to the user's request; report evidence "
+                        "and coordinates relative to this exact image."),
+        },
+        "safety": "Only the current state_id + valid local element_index can dispatch; UIA text is not effect verification.",
+    }
+    if pointer is not None:
+        hover = pointer.get("hover")
+        view["pointer"] = {
+            "screen": pointer.get("screen"),
+            "inside_target": bool(pointer.get("inside_target")),
+            "image": pointer.get("image"),
+            "hover": (
+                {"name": hover.get("name"), "role": hover.get("role")}
+                if isinstance(hover, dict) else None),
+        }
+    if input_readiness is not None:
+        occluders = input_readiness.get("occluded_by") or []
+        foreground = input_readiness.get("foreground")
+        view["input_readiness"] = {
+            "target_is_foreground": bool(input_readiness.get("target_is_foreground")),
+            "foreground": (
+                {"process_name": foreground.get("process_name"), "title": foreground.get("title")}
+                if isinstance(foreground, dict) else None),
+            "occluded_by_count": len(occluders),
+            "occluded_by_first_title": (
+                occluders[0].get("title") if occluders else None),
+            "keyboard_ready": bool(input_readiness.get("keyboard_ready")),
+        }
+    return view
 
 
 def _crop_window_capture_to_region(
@@ -2208,6 +2460,12 @@ def _app_state_snapshot_unlocked(
     if include_image:
         image_info = _capture_target_window_state_image(target, capture_provider=capture_provider, surface=surface)
 
+    # Pointer position and input readiness are independent of the raster. A
+    # --no-image observation must still tell a text-only agent where the
+    # pointer is and whether the target can actually receive input.
+    pointer = _pointer_observation(target, surface, image_info)
+    input_readiness = _input_readiness(target, image_info)
+
     public: dict[str, Any] = {
         "ok": True,
         "time": _now_iso(),
@@ -2226,6 +2484,8 @@ def _app_state_snapshot_unlocked(
             "local_host_node_count": len(all_elements) if surface.get("remote") else None,
         },
         "raster": None,
+        "pointer": pointer,
+        "input_readiness": input_readiness,
         "contract": {
             "element_target": (
                 "Unavailable for remote desktop content; local UIA does not describe controls inside the remote session."
@@ -2244,6 +2504,9 @@ def _app_state_snapshot_unlocked(
             "success": "action_sent means input was dispatched, not that the requested UI effect happened; re-observe to verify effect.",
         },
     }
+    public["machine_view"] = machine_readable_live_view(
+        surface, public["accessibility"], pointer=pointer,
+        input_readiness=input_readiness)
     if image_info is not None:
         public["raster"] = {
             "mime": image_info.get("mime"),
@@ -2266,6 +2529,8 @@ def _app_state_snapshot_unlocked(
     }
     state_id = OBSERVATION_STATES.store(private=private)
     public["state_id"] = state_id
+    public["pointer"]["meaning"] = (
+        f"Image coordinates are valid only for state_id {state_id}; re-observe before reusing them.")
     public["expires_in_seconds"] = OBSERVATION_STATE_TTL_SECONDS
     if bound_controller_id:
         public["controller_binding"] = {"bound": True, "controller_id": bound_controller_id}
@@ -2333,6 +2598,14 @@ def _state_current_window_or_raise(entry: dict[str, Any]) -> dict[str, Any] | No
 
 def _same_uia_identity(expected: dict[str, Any], live: dict[str, Any] | None) -> bool:
     if not live:
+        return False
+    # A control's own HWND is the only observed field that separates two
+    # same-named HWND-backed controls in one window (repeated dialog buttons,
+    # identical list rows). Compare it whenever both sides expose one; never
+    # treat a missing/zero handle as evidence of a different control.
+    expected_control_hwnd = int(expected.get("native_window_handle") or 0)
+    live_control_hwnd = int(live.get("native_window_handle") or 0)
+    if expected_control_hwnd and live_control_hwnd and expected_control_hwnd != live_control_hwnd:
         return False
     for key in ("automation_id", "control_type", "class_name"):
         a = str(expected.get(key) or "")
@@ -2427,8 +2700,8 @@ def resolve_state_bound_action(data: dict[str, Any], *, action: str) -> dict[str
             raise ObservationStateError("this observation has no raster; request app-state with include_image=true", code="STALE_STATE", retry="reobserve")
         if not (0 <= ix < int(width) and 0 <= iy < int(height)):
             raise ObservationStateError("image_x/image_y are outside the referenced raster", code="INVALID_STATE", retry="never")
-        px = int(region["x"]) + int(ix * int(region["width"]) / max(1, int(width)))
-        py = int(region["y"]) + int(iy * int(region["height"]) / max(1, int(height)))
+        screen_point = _screen_point_from_raster(ix, iy, region, width, height)
+        px, py = int(screen_point["x"]), int(screen_point["y"])
         owner = window_at(px, py)
         expected_hwnd = int(entry.get("private", {}).get("target_window", {}).get("hwnd") or 0)
         if not owner or int(owner.get("hwnd") or 0) != expected_hwnd:
@@ -2598,8 +2871,36 @@ def set_window_scope(data: dict[str, Any]) -> dict[str, Any]:
     configured = {"hwnd": int(chosen["hwnd"]), "pid": int(chosen["pid"]), "process_name": chosen.get("process_name"), "process_path": chosen.get("process_path"), "title_at_selection": chosen.get("title"), "selected_at": _now_iso()}
     with WINDOW_SCOPE_LOCK:
         ACTIVE_WINDOW_SCOPE = configured
-    activated = activate_window(int(chosen["hwnd"])) if bool(data.get("activate", True)) else False
-    return {"ok": True, "activated": activated, "scope": window_scope_status()}
+    activate = bool(data.get("activate", True))
+    activated = activate_window(int(chosen["hwnd"])) if activate else False
+    if activate:
+        # A foreground owner can re-take focus right after activation. Settle
+        # once, then attest the real post-settle foreground instead of
+        # reporting the activation call as a verified state.
+        time.sleep(0.12)
+    foreground = _compact_foreground(focused_window())
+    verified = bool(
+        foreground and int(foreground.get("hwnd") or 0) == int(chosen["hwnd"]))
+    foreground_lost = bool(activate and activated and not verified)
+    if verified:
+        retry = "none"
+        message = "Target window is the foreground window after activation."
+    elif activate:
+        retry = "reobserve"
+        message = ("Another window owns the foreground after activation; the scope is selected but keyboard "
+                   "input is not ready. Re-observe, then retry focus or raise the target window.")
+    else:
+        retry = "reobserve"
+        message = "Scope selected without activation; the target may not be the foreground window."
+    return {
+        "ok": True,
+        "activated": verified,
+        "foreground": foreground,
+        "foreground_lost": foreground_lost,
+        "retry": retry,
+        "message": message,
+        "scope": window_scope_status(),
+    }
 
 
 def clear_window_scope() -> bool:
@@ -6118,12 +6419,78 @@ class UserRecordingManager:
                 entry["demonstrated_text"] = step["text"]
             if surface == "remote_desktop":
                 entry["target_evidence"] = "screenshot_only_not_local_uia"
+            target = entry.get("local_target_candidate") or {}
+            name = str(target.get("name") or "").strip()
+            identity = str(target.get("automation_id") or "").strip()
+            label = (name if _is_meaningful_control_label(name) else
+                     identity if _is_meaningful_control_label(identity) else "")
+            if label:
+                entry["machine_instruction"] = {
+                    "observed_action": str(entry["action"]),
+                    "target_candidate": label[:160],
+                    "role": target.get("role"),
+                    "confidence": "asynchronous_uia_candidate_not_event_bound",
+                }
+            else:
+                entry["machine_instruction"] = {
+                    "observed_action": str(entry["action"]),
+                    "target_candidate": None,
+                    "confidence": "historical_input_without_semantic_recipient",
+                }
             if entry.get("image_relation") == "before_input":
                 entry["image_warning"] = "context_before_action_not_result"
             entries.append(entry)
+        # Only ask a vision-capable collaborator about grounded, unresolved
+        # image evidence; do not launch an agent, OCR, or duplicate screenshots.
+        unresolved = [
+            entry for entry in entries
+            if entry["machine_instruction"]["target_candidate"] is None
+            and entry.get("action") in {"click", "double_click", "drag", "scroll"}
+        ]
+        ordered = sorted(
+            unresolved,
+            key=lambda entry: (0 if entry.get("before_image") else
+                               1 if entry.get("button") == "right" else 2,
+                               int(entry.get("step") or 0)),
+        )
+        image_tasks = []
+        for entry in ordered:
+            if not (entry.get("before_image") or entry.get("image")):
+                continue
+            image_tasks.append({
+                "step": entry["step"],
+                "before_image": entry.get("before_image"),
+                "after_image": entry.get("image"),
+                "image_at": entry.get("image_at"),
+                "reason": ("remote_controls_not_visible_to_local_uia"
+                           if entry.get("surface") == "remote_desktop"
+                           else "no_named_target_candidate"),
+                "request": ("In the user's demonstration context, identify the "
+                            "visible target of this historical action if evidence "
+                            "permits. Do not invent labels or replay coordinates."),
+                "read_only": True,
+            })
+            if len(image_tasks) >= 6:
+                break
         return {
             "format_version": 1,
             "kind": "contextual_user_demonstration_index",
+            "machine_view": {
+                "kind": "recorded_semantic_orientation",
+                "machine_steps": len(entries),
+                "named_local_candidates": sum(
+                    1 for e in entries if e["machine_instruction"]["target_candidate"]),
+                "unresolved_pointer_steps": len(unresolved),
+                "text_first": True,
+                "vision_review": {
+                    "recommended": bool(unresolved),
+                    "requests": image_tasks,
+                    "deferred_unresolved_steps": max(
+                        0, len(unresolved) - len(image_tasks)),
+                    "note": "Only request visual review for relevant uncertain steps selected using user conversation context. Images are historical evidence.",
+                },
+                "source_provenance": "sampled_after_human_input_not_intent_or_verified_effect",
+            },
             "input_source": "human_physical_events",
             "context_source": "user_conversation",
             "context_rule": ("Use the accompanying user message to identify the relevant "
@@ -8346,13 +8713,14 @@ def agent_quickstart(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> dict
         "preferred_api": base,
         "rule": "Acquire control -> observe -> act -> observe again -> finish. Never assume dispatch proves the requested UI effect.",
         "preferred_agent_entry": {
-            "mcp": "Configure agent_computer_bridge_mcp.py as a local stdio MCP server. It owns discovery/lease lifecycle but routes all desktop behavior through this HTTP/Core owner.",
-            "shell_fallback": "python agent_computer_bridge.py agent-session",
-            "finish_fallback": "python agent_computer_bridge.py agent-finish --controller-id <id>",
+            "mcp": "If MCP tools are already discoverable, use computer_start/computer_observe/state-bound actions/computer_finish. Do not require new MCP configuration.",
+            "shell_fallback": "agent.cmd start (no MCP registration; Python 3.10+ and explicit agent.cmd setup when doctor reports missing packages)",
+            "finish_fallback": "agent.cmd finish --controller-id <id>",
         },
         "first_steps": [
-            "Preferred: MCP computer_start -> computer_observe -> state-bound MCP action -> computer_observe -> computer_finish",
-            f"Without MCP: run `python agent_computer_bridge.py agent-session`; it starts this server if needed and acquires the controller lease in one step",
+            "If MCP is already available: computer_start -> computer_observe -> state-bound MCP action -> computer_observe -> computer_finish",
+            "Otherwise use `agent.cmd doctor` (and `agent.cmd setup` only if needed), then `agent.cmd start`; it starts or connects to the matching server and acquires one controller lease without configuring MCP",
+            "Shell roundtrip: agent.cmd windows -> agent.cmd observe --controller-id ID -> state-bound agent.cmd action -> fresh observe -> agent.cmd finish --controller-id ID",
             f"Use GET {base}/doctor only when environment health is uncertain",
             f"Use GET {base}/discovery only for low-level/manual HTTP integration",
         ],
@@ -8427,8 +8795,8 @@ def _interactive_desktop_status() -> dict[str, Any]:
         return {"available": False, "platform_supported": True, "reason": f"interactive desktop probe failed: {exc}"}
 
 
-def doctor_report(*, capture_probe: bool = False) -> dict[str, Any]:
-    """Non-mutating runtime diagnostics for Computer Use prerequisites."""
+def doctor_report(*, capture_probe: bool = False, server_process: bool = False) -> dict[str, Any]:
+    """Non-mutating diagnostics; runtime stop status applies only to the server process."""
     checks: list[dict[str, Any]] = []
 
     def add(name: str, status: str, **details: Any) -> None:
@@ -8470,14 +8838,25 @@ def doctor_report(*, capture_probe: bool = False) -> dict[str, Any]:
         add("desktop_capture_probe", "skipped", reason="Set capture_probe=true to explicitly capture one diagnostic frame.")
 
     add("input_failsafe", "pass" if bool(pyautogui.FAILSAFE) else "fail", pyautogui_failsafe=bool(pyautogui.FAILSAFE))
-    add(
-        "physical_escape_stop",
-        "pass" if PHYSICAL_ESCAPE_STOP_ACTIVE else "warn",
-        active=bool(PHYSICAL_ESCAPE_STOP_ACTIVE),
-        source=PHYSICAL_ESCAPE_STOP_SOURCE,
-    )
+    if server_process:
+        add(
+            "physical_escape_stop",
+            "pass" if PHYSICAL_ESCAPE_STOP_ACTIVE else "warn",
+            active=bool(PHYSICAL_ESCAPE_STOP_ACTIVE),
+            source=PHYSICAL_ESCAPE_STOP_SOURCE,
+        )
+    else:
+        add(
+            "physical_escape_stop", "not_applicable", active=None, source=None,
+            reason="Physical Esc stop belongs to the running Bridge server, not this diagnostic process.",
+        )
 
-    mandatory_fail = any(item["status"] == "fail" and item["name"] in {"interactive_desktop", "monitors", "input_failsafe"} for item in checks)
+    mandatory_names = {"interactive_desktop", "monitors", "input_failsafe"}
+    if capture_probe:
+        # An explicitly requested image check must not claim readiness when
+        # the desktop cannot actually be captured.
+        mandatory_names.add("desktop_capture_probe")
+    mandatory_fail = any(item["status"] == "fail" and item["name"] in mandatory_names for item in checks)
     if not is_windows:
         readiness = "unsupported"
     elif mandatory_fail:
@@ -8490,6 +8869,10 @@ def doctor_report(*, capture_probe: bool = False) -> dict[str, Any]:
     return {
         "ok": readiness in {"ready", "degraded"},
         "readiness": readiness,
+        "diagnostic_context": "bridge_server" if server_process else "standalone_process",
+        "version": VERSION,
+        "build_id": BUILD_ID,
+        "pid": os.getpid(),
         "time": _now_iso(),
         "checks": checks,
         "controller": CONTROLLER_LEASE.status(),
@@ -8713,6 +9096,7 @@ def endpoint_catalog() -> list[dict[str, Any]]:
 
 def discovery_document(host: str, port: int, *, auth_required: bool, authenticated: bool = True) -> dict[str, Any]:
     status = runtime_status(host, port)
+    guidance = agent_quickstart(host, port)
     caps = {
         "observe": ["observe","app-state","screen","mouse","screenshot","pixel","viewport","windows","processes","focused-window","window-at","monitors","scope"],
         "pointer": ["move","click","drag","mouse-down","mouse-up","scroll","recover","dry_run"],
@@ -8789,18 +9173,12 @@ def discovery_document(host: str, port: int, *, auth_required: bool, authenticat
         "dry_run": "Set dry_run=true on move/click/drag/scroll to validate and resolve targets without input.",
         "endpoints": endpoint_catalog(),
         "openapi": f"http://{host}:{port}/{API_VERSION}/openapi.json",
-        "preferred_agent_entry": {
-            "mcp": "agent_computer_bridge_mcp.py (stdio) hides controller/discovery plumbing and never exposes unbound raw clicks",
-            "shell_fallback": "python agent_computer_bridge.py agent-session",
-            "finish_fallback": "python agent_computer_bridge.py agent-finish --controller-id <id>",
-        },
-        "recommended_loop": [
-            "MCP: computer_start once",
-            "computer_observe for a fresh target-bound state (or low-level GET /v1/app-state if MCP is unavailable)",
-            "act only against that observation: local element_index preferred; remote_desktop uses that raster's image_x/image_y",
-            "if dispatch_status=possibly_sent or retry=reobserve, re-observe before deciding whether a retry is safe",
-            "computer_observe again to verify the requested UI effect",
-            "computer_finish when done; use shutdown=always when the user expects no bridge process left running",
+        # Keep the public discovery route consistent with the canonical quickstart.
+        "preferred_agent_entry": guidance["preferred_agent_entry"],
+        "recommended_loop": guidance["first_steps"][:3] + [
+            "Act only against a fresh state: local element_index is a candidate; remote_desktop uses its raster image_x/image_y.",
+            "If dispatch_status=possibly_sent or retry=reobserve, re-observe before deciding whether a retry is safe.",
+            "Verify the visible UI effect after every action; dispatch alone does not prove success.",
         ],
         "coordinate_model": {
             "primary_monitor": {"x": 0, "y": 0, "width": status["screen"]["width"], "height": status["screen"]["height"]},
@@ -9254,7 +9632,7 @@ class AgentBridgeHandler(BaseHTTPRequestHandler):
 
             if path == "/doctor":
                 capture_probe = query.get("capture_probe", ["0"])[0].lower() in {"1", "true", "yes"}
-                self.send_json(doctor_report(capture_probe=capture_probe))
+                self.send_json(doctor_report(capture_probe=capture_probe, server_process=True))
                 return
 
             if path == "/observe":
